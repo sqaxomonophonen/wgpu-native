@@ -1,3 +1,5 @@
+use log;
+use std::ffi::CString;
 use std::{borrow::Cow, marker::PhantomData, sync::Arc};
 use wgc::id;
 
@@ -280,4 +282,94 @@ pub unsafe extern "C" fn wgpuSurfaceGetPreferredFormat(
         Err(err) => panic!("Could not get preferred swap chain format: {}", err),
     };
     return preferred_format;
+}
+
+struct DeviceCallback<T> {
+    device: id::DeviceId,
+    callback: T,
+    userdata: *mut std::os::raw::c_void,
+}
+
+type DeviceCallbackList<T> = Vec<DeviceCallback<T>>;
+
+trait DeviceCallbackListExt<T> {
+    fn set_callback(&mut self, v: DeviceCallback<T>);
+    fn get_by_device(&self, device: id::DeviceId) -> Option<*const DeviceCallback<T>>;
+}
+
+impl<T> DeviceCallbackListExt<T> for DeviceCallbackList<T> {
+    fn set_callback(&mut self, v: DeviceCallback<T>) {
+        for i in 0..self.len() {
+            if self[i].device == v.device {
+                self[i] = v;
+                return;
+            }
+        }
+        self.push(v);
+    }
+    fn get_by_device(&self, device: id::DeviceId) -> Option<*const DeviceCallback<T>> {
+        for i in 0..self.len() {
+            let e = &self[i];
+            if e.device == device {
+                return Some(e);
+            }
+        }
+        return None;
+    }
+}
+
+static mut UNCAPTURED_ERROR_CALLBACKS: DeviceCallbackList<native::WGPUErrorCallback> =
+    DeviceCallbackList::new();
+static mut DEVICE_LOST_CALLBACKS: DeviceCallbackList<native::WGPUDeviceLostCallback> =
+    DeviceCallbackList::new();
+
+#[no_mangle]
+pub unsafe extern "C" fn wgpuDeviceSetDeviceLostCallback(
+    device: id::DeviceId,
+    callback: native::WGPUDeviceLostCallback,
+    userdata: *mut std::os::raw::c_void,
+) {
+    DEVICE_LOST_CALLBACKS.set_callback(DeviceCallback {
+        device: device,
+        callback: callback,
+        userdata: userdata,
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wgpuDeviceSetUncapturedErrorCallback(
+    device: id::DeviceId,
+    callback: native::WGPUErrorCallback,
+    userdata: *mut std::os::raw::c_void,
+) {
+    UNCAPTURED_ERROR_CALLBACKS.set_callback(DeviceCallback {
+        device: device,
+        callback: callback,
+        userdata: userdata,
+    });
+}
+
+pub fn handle_device_error(device: id::DeviceId, typ: native::WGPUErrorType, msg: &str) {
+    log::debug!("Device error ({}): {}", typ, msg);
+    let msg_c = CString::new(msg).unwrap();
+    unsafe {
+        match typ {
+            native::WGPUErrorType_DeviceLost => {
+                let cb = DEVICE_LOST_CALLBACKS.get_by_device(device);
+                if let Some(cb) = cb {
+                    (*cb).callback.unwrap()(
+                        native::WGPUDeviceLostReason_Destroyed,
+                        msg_c.as_ptr(),
+                        (*cb).userdata,
+                    );
+                }
+            }
+            _ => {
+                let cb = UNCAPTURED_ERROR_CALLBACKS.get_by_device(device);
+                if let Some(cb) = cb {
+                    (*cb).callback.unwrap()(typ, msg_c.as_ptr(), (*cb).userdata);
+                }
+            }
+        }
+    }
 }

@@ -1,5 +1,7 @@
 use crate::conv::{map_adapter_options, map_device_descriptor, map_shader_module};
-use crate::{check_error, conv, follow_chain, make_slice, native, OwnedLabel, GLOBAL};
+use crate::{
+    check_error, conv, follow_chain, handle_device_error, make_slice, native, OwnedLabel, GLOBAL,
+};
 use lazy_static::lazy_static;
 use std::{
     borrow::Cow,
@@ -176,7 +178,7 @@ fn write_limits_struct(
 pub unsafe extern "C" fn wgpuDeviceCreateShaderModule(
     device: id::DeviceId,
     descriptor: &native::WGPUShaderModuleDescriptor,
-) -> id::ShaderModuleId {
+) -> Option<id::ShaderModuleId> {
     let label = OwnedLabel::new(descriptor.label);
     let source = follow_chain!(
         map_shader_module(descriptor,
@@ -188,9 +190,13 @@ pub unsafe extern "C" fn wgpuDeviceCreateShaderModule(
         label: label.as_cow(),
         shader_bound_checks: wgt::ShaderBoundChecks::default(),
     };
-    check_error(
-        gfx_select!(device => GLOBAL.device_create_shader_module(device, &desc, source, PhantomData)),
-    )
+    let (module, err) = gfx_select!(device => GLOBAL.device_create_shader_module(device, &desc, source, PhantomData));
+    if let Some(err) = err {
+        handle_device_error(device, native::WGPUErrorType_Unknown, &format!("{}", err));
+        None
+    } else {
+        Some(module)
+    }
 }
 
 #[no_mangle]
@@ -689,13 +695,29 @@ pub extern "C" fn wgpuSwapChainGetCurrentTextureView(
     let surface_id = swap_chain;
     let device_id = get_device_from_surface(surface_id);
     let result =
-        gfx_select!(device_id => GLOBAL.surface_get_current_texture(surface_id, PhantomData));
-    let texture = result
-        .expect("Unable to get swap chain texture view")
-        .texture_id
-        .unwrap();
-    let desc = wgc::resource::TextureViewDescriptor::default();
-    Some(gfx_select!(texture => GLOBAL.texture_create_view(texture, &desc, PhantomData)).0)
+        gfx_select!(device_id => GLOBAL.surface_get_current_texture(surface_id, PhantomData))
+            .expect("Unable to get swap chain texture view");
+
+    match result.status {
+        wgt::SurfaceStatus::Good | wgt::SurfaceStatus::Suboptimal => {
+            let texture = result.texture_id.unwrap();
+            let desc = wgc::resource::TextureViewDescriptor::default();
+            Some(gfx_select!(texture => GLOBAL.texture_create_view(texture, &desc, PhantomData)).0)
+        }
+        wgt::SurfaceStatus::Timeout => {
+            handle_device_error(device_id, native::WGPUErrorType_Unknown, "timeout");
+            None
+        }
+        wgt::SurfaceStatus::Outdated => {
+            handle_device_error(device_id, native::WGPUErrorType_Unknown, "outdated");
+            None
+        }
+        wgt::SurfaceStatus::Lost => {
+            handle_device_error(device_id, native::WGPUErrorType_Unknown, "lost");
+            //handle_device_error(device_id, native::WGPUErrorType_DeviceLost, "lost"); // <<< ???
+            None
+        }
+    }
 }
 
 #[no_mangle]
