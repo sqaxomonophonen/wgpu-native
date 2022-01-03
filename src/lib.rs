@@ -1,6 +1,6 @@
 use log;
 use std::ffi::CString;
-use std::{borrow::Cow, marker::PhantomData, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, marker::PhantomData, sync::Arc, sync::Mutex};
 use wgc::id;
 
 pub mod command;
@@ -285,55 +285,18 @@ pub unsafe extern "C" fn wgpuSurfaceGetPreferredFormat(
 }
 
 struct DeviceCallback<T> {
-    device: id::DeviceId,
     callback: T,
     userdata: *mut std::os::raw::c_void,
 }
 
-type DeviceCallbackList<T> = Vec<DeviceCallback<T>>;
+type UncapturedErrorCallback = DeviceCallback<native::WGPUErrorCallback>;
+type DeviceLostCallback = DeviceCallback<native::WGPUDeviceLostCallback>;
 
-trait DeviceCallbackListExt<T> {
-    fn set_callback(&mut self, v: DeviceCallback<T>);
-    fn get_by_device(&self, device: id::DeviceId) -> Option<*const DeviceCallback<T>>;
-}
+unsafe impl<T> Send for DeviceCallback<T> {}
 
-impl<T> DeviceCallbackListExt<T> for DeviceCallbackList<T> {
-    fn set_callback(&mut self, v: DeviceCallback<T>) {
-        for i in 0..self.len() {
-            if self[i].device == v.device {
-                self[i] = v;
-                return;
-            }
-        }
-        self.push(v);
-    }
-    fn get_by_device(&self, device: id::DeviceId) -> Option<*const DeviceCallback<T>> {
-        for i in 0..self.len() {
-            let e = &self[i];
-            if e.device == device {
-                return Some(e);
-            }
-        }
-        return None;
-    }
-}
-
-static mut UNCAPTURED_ERROR_CALLBACKS: DeviceCallbackList<native::WGPUErrorCallback> =
-    DeviceCallbackList::new();
-static mut DEVICE_LOST_CALLBACKS: DeviceCallbackList<native::WGPUDeviceLostCallback> =
-    DeviceCallbackList::new();
-
-#[no_mangle]
-pub unsafe extern "C" fn wgpuDeviceSetDeviceLostCallback(
-    device: id::DeviceId,
-    callback: native::WGPUDeviceLostCallback,
-    userdata: *mut std::os::raw::c_void,
-) {
-    DEVICE_LOST_CALLBACKS.set_callback(DeviceCallback {
-        device: device,
-        callback: callback,
-        userdata: userdata,
-    });
+lazy_static::lazy_static! {
+    static ref UNCAPTURED_ERROR_CALLBACKS: Arc<Mutex<HashMap<id::DeviceId, UncapturedErrorCallback>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref DEVICE_LOST_CALLBACKS: Arc<Mutex<HashMap<id::DeviceId, DeviceLostCallback>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
 #[no_mangle]
@@ -342,11 +305,28 @@ pub unsafe extern "C" fn wgpuDeviceSetUncapturedErrorCallback(
     callback: native::WGPUErrorCallback,
     userdata: *mut std::os::raw::c_void,
 ) {
-    UNCAPTURED_ERROR_CALLBACKS.set_callback(DeviceCallback {
-        device: device,
-        callback: callback,
-        userdata: userdata,
-    });
+    UNCAPTURED_ERROR_CALLBACKS.lock().unwrap().insert(
+        device,
+        UncapturedErrorCallback {
+            callback: callback,
+            userdata: userdata,
+        },
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wgpuDeviceSetDeviceLostCallback(
+    device: id::DeviceId,
+    callback: native::WGPUDeviceLostCallback,
+    userdata: *mut std::os::raw::c_void,
+) {
+    DEVICE_LOST_CALLBACKS.lock().unwrap().insert(
+        device,
+        DeviceLostCallback {
+            callback: callback,
+            userdata: userdata,
+        },
+    );
 }
 
 pub fn handle_device_error(device: id::DeviceId, typ: native::WGPUErrorType, msg: &str) {
@@ -355,7 +335,8 @@ pub fn handle_device_error(device: id::DeviceId, typ: native::WGPUErrorType, msg
     unsafe {
         match typ {
             native::WGPUErrorType_DeviceLost => {
-                let cb = DEVICE_LOST_CALLBACKS.get_by_device(device);
+                let cbs = DEVICE_LOST_CALLBACKS.lock().unwrap();
+                let cb = cbs.get(&device);
                 if let Some(cb) = cb {
                     (*cb).callback.unwrap()(
                         native::WGPUDeviceLostReason_Destroyed,
@@ -365,7 +346,8 @@ pub fn handle_device_error(device: id::DeviceId, typ: native::WGPUErrorType, msg
                 }
             }
             _ => {
-                let cb = UNCAPTURED_ERROR_CALLBACKS.get_by_device(device);
+                let cbs = UNCAPTURED_ERROR_CALLBACKS.lock().unwrap();
+                let cb = cbs.get(&device);
                 if let Some(cb) = cb {
                     (*cb).callback.unwrap()(typ, msg_c.as_ptr(), (*cb).userdata);
                 }
