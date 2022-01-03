@@ -226,29 +226,45 @@ int main() {
                                 });
 
   while (!glfwWindowShouldClose(window)) {
-    int width = 0;
-    int height = 0;
-    glfwGetWindowSize(window, &width, &height);
 
-    if (width != prevWidth || height != prevHeight) {
-      prevWidth = width;
-      prevHeight = height;
+    WGPUTextureView nextTexture = NULL;
 
-      swapChain = wgpuDeviceCreateSwapChain(
-          device, surface,
-          &(WGPUSwapChainDescriptor){
-              .usage = WGPUTextureUsage_RenderAttachment,
-              .format = swapChainFormat,
-              .width = prevWidth,
-              .height = prevHeight,
-              .presentMode = WGPUPresentMode_Fifo,
-          });
+    for (int attempt = 0; attempt < 2; attempt++) {
+
+      int width = 0;
+      int height = 0;
+      glfwGetWindowSize(window, &width, &height);
+
+      if (width != prevWidth || height != prevHeight) {
+        prevWidth = width;
+        prevHeight = height;
+
+        swapChain = wgpuDeviceCreateSwapChain(
+            device, surface,
+            &(WGPUSwapChainDescriptor){
+                .usage = WGPUTextureUsage_RenderAttachment,
+                .format = swapChainFormat,
+                .width = prevWidth,
+                .height = prevHeight,
+                .presentMode = WGPUPresentMode_Fifo,
+            });
+      }
+
+      nextTexture = wgpuSwapChainGetCurrentTextureView(swapChain);
+
+      if (attempt == 0 && !nextTexture) {
+        // probably lost surface; try again, creating a new swap chain
+        prevWidth = 0;
+        prevHeight = 0;
+        continue;
+      }
+
+      break;
     }
 
-    WGPUTextureView nextTexture = wgpuSwapChainGetCurrentTextureView(swapChain);
     if (!nextTexture) {
       printf("Cannot acquire next swap chain texture\n");
-      return 1;
+      exit(1);
     }
 
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(
